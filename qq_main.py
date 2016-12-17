@@ -5,7 +5,7 @@ from httplib import HTTPConnection, HTTPSConnection
 from time import time, strftime, localtime
 from traceback import print_exc, format_exception
 from collections import OrderedDict
-import re, multiprocessing, os, sys, json, StringIO, gzip
+import re, multiprocessing, os, sys, json, StringIO, gzip, socket
 try:
   import xml.etree.cElementTree as ET
 except ImportError:
@@ -28,7 +28,7 @@ sys.setdefaultencoding('utf8')
 # 歌手MV
 # https://c.y.qq.com/mv/fcgi-bin/fcg_singer_mv.fcg?cid=205360581&singermid=0020PeOh4ZaCw1&order=listen&begin=0&num=5&g_tk=1559226564&jsonpCallback=singermvlistJsonCallback&loginUin=2993104336&hostUin=0&format=jsonp&inCharset=utf8&outCharset=utf-8&notice=0&platform=yqq&needNewCode=0
 
-# 档次爬取时间
+# 当次爬取时间
 SPIDER_TIME = strftime('%Y-%m-%d', localtime(time()))
 
 # 格式化输出文件 间隔符号
@@ -76,18 +76,12 @@ dir_path = "./%s/" % SPIDER_TIME
 if not os.path.exists(dir_path):
     os.mkdir(dir_path)
 
-SINGER_PATH = r"./%s/singer.txt" % SPIDER_TIME
-TRACK_PATH = r"./%s/track.txt" % SPIDER_TIME
-# 创建文件
-open(SINGER_PATH, "w")
-open(TRACK_PATH, "w")
-################################################################
+FILE_TYPE = "txt"
+SINGER_PATH = r"./%s/singer_" % SPIDER_TIME
+TRACK_PATH = r"./%s/track_" % SPIDER_TIME
 
-def gzdecode(data) :
-    compressedstream = StringIO.StringIO(data)
-    gziper = gzip.GzipFile(fileobj=compressedstream)
-    data2 = gziper.read()   # 读取解压缩后数据
-    return data2
+
+################################################################
 
 #   爬取 歌手 个人详细资历
 #   singer (list) =>
@@ -112,44 +106,45 @@ def spider_singerProfile_task(host, url_config, headers = {
         full_url = "https://%s%s" % (host, url)
         retry_times = 50
         while retry_times: # 如果出现错误 可以重新执行
-            conn = HTTPSConnection(host, timeout = 10)
-            yield conn.request("GET", url, headers = headers)
-            try:
-                response = conn.getresponse()
-            except:
-                # 如果发生了网络IO错误 则 重试
-                retry_times -= 1
-                continue
+            retry_times -= 1
 
-            if not response.status is 200:
-                retry_times -= 1
-                continue
-            data = response.read()
-            conn.close()
-            # 解析data, 数据格式为 XML
-            root = ET.fromstring(data) #从字符串传递xml
-            if not root.find("code").text is '0':
-                retry_times -= 1
-                continue
+            # 需要改写
+            g = gevent.spawn(fetcher, host, url, scheme = "https", headers = headers)
+            while not g.ready() is True:
+                # gevent.sleep(0.001) # 1毫秒
+                gevent.sleep(0.25) # 250毫秒
+                ret = yield g
+
+            if isinstance(ret, gevent.Greenlet): ret = ret.value
+            if ret is None: continue
+            (data, cost) = ret
+            #######
+
             singer_country = '' # 歌手国籍
             try:
+                # 解析data, 数据格式为 XML
+                root = ET.fromstring(data) #从字符串传递xml
+                if not root.find("code").text is '0':
+                    continue
                 for v in root.find("data").find("info").find("basic").findall("item"):
                     if v.find("key").text == u"国籍":
                         singer_country = v.find("value").text
                         break
             except:
-                pass
+                if not retry_times is 1: continue
+
             # merge singer data
             singer["country"] = singer_country
             # 写文件
             def write():
-                with open(SINGER_PATH, "ab+") as fp: # singer file fp
-                    fp.seek(os.SEEK_END)
+                singer_path = r"%s%s.%s" % (SINGER_PATH, url_params["file_tag"], FILE_TYPE)
+                if not os.path.exists(singer_path): open(singer_path, "w")
+                with open(singer_path, "ab+") as fp: # singer file fp
                     print >> fp,  SPILIT_ICON.join([str(singer[k]) for k in singer])
             yield write()
-            yield TaskReturn(url = full_url, result = 1) # 爬取成功
+            yield TaskReturn(url = full_url, result = 1, retry_times = 50 - retry_times, http_cost = cost) # 爬取成功
         # 爬取失败
-        yield TaskReturn(url = full_url, result = 0)
+        yield TaskReturn(url = full_url, result = 0, retry_times = 50 - retry_times, http_cost = 0)
     except GeneratorExit:
         pass
     except:
@@ -176,24 +171,29 @@ def spider_singerTrack_task(host, url_config, headers = {
         full_url = "http://%s%s" % (host, url)
         retry_times = 50
         while retry_times:
-            conn = HTTPConnection(host, timeout=10)
-            yield conn.request("GET", url, headers=headers)
-            try:
-                response = conn.getresponse()
-            except:
-                # 如果发生了网络IO错误 则 重试
-                retry_times -= 1
-                continue
-            if not response.status is 200:
-                retry_times -= 1
-                continue
-            data = gzdecode(response.read())
-            conn.close()
+            retry_times -= 1
+
+            # 需要改写
+            g = gevent.spawn(fetcher, host, url, scheme = "http", headers = headers)
+            while not g.ready() is True:
+                # gevent.sleep(0.001) # 1毫秒
+                gevent.sleep(0.25) # 250毫秒
+                ret = yield g
+
+            if isinstance(ret, gevent.Greenlet): ret = ret.value
+            if ret is None: continue
+            (data, cost) = ret
+            #######
+
+            data = gzdecode(data)
             # 解析data, 数据格式为 json
             response_json = data[31:-1]
-            track_json = json.loads(response_json)
+            try:
+                track_json = json.loads(response_json)
+            except UnicodeDecodeError: # 如果发生解码错误
+                continue
+
             if not track_json.get("code") is 0:
-                retry_times -= 1
                 continue
             songs = track_json.get("data").get("list") # 解析出单曲列表
 
@@ -201,12 +201,10 @@ def spider_singerTrack_task(host, url_config, headers = {
                 # 获取歌曲ID
                 songId = song.get("musicData").get("songid") if song.get("songid") is None else song.get("songid")
                 if songId is None:
-                    retry_times -= 1
                     continue
                 # 获取歌曲名称
                 songName = song.get("musicData").get("songname") if song.get("songname") is None else song.get("songname")
                 if songName is None:
-                    retry_times -= 1
                     continue
                 # 获取专辑ID
                 albumid = song.get("musicData").get("albumid") if song.get("musicData").get("albumid") else ""
@@ -256,6 +254,7 @@ def spider_singerTrack_task(host, url_config, headers = {
                     url_params = {
                         "songmid": songmid,
                         "albummid": audioMid,
+                        "file_tag": url_params["file_tag"],
                     }
                 ))
 
@@ -269,11 +268,12 @@ def spider_singerTrack_task(host, url_config, headers = {
                     url_params = {
                         "begin": (url_params["begin"] + 1) * url_params["num"],
                         "num": url_params["num"],
+                        "file_tag": url_params["file_tag"],
                     }
                 ))
-            yield TaskReturn(url = full_url, result = 1)
+            yield TaskReturn(url = full_url, result = 1, retry_times = 50 - retry_times, http_cost = cost)
          # 爬取失败
-        yield TaskReturn(url = full_url, result = 0)
+        yield TaskReturn(url = full_url, result = 0, retry_times = 50 - retry_times, http_cost = 0)
     except GeneratorExit:
         pass
     except :
@@ -296,38 +296,46 @@ def spider_albumProfile_task(host, url_config, headers = {
         retry_times = 50
 
         while retry_times:
-            conn = HTTPConnection(host, timeout=10)
-            yield conn.request("GET", url, headers=headers)
+            retry_times -= 1
+
+            # 需要改写
+            g = gevent.spawn(fetcher, host, url, scheme = "http", headers = headers)
+            while not g.ready() is True:
+                # gevent.sleep(0.001) # 1毫秒
+                gevent.sleep(0.25) # 250毫秒
+                ret = yield g
+
+            if isinstance(ret, gevent.Greenlet): ret = ret.value
+            if ret is None: continue
+            (data, cost) = ret
+            #######
+
+            data = gzdecode(data)
+            genre = ''
             try:
-                response = conn.getresponse()
+                # 从 data 中取出数据, 数据格式为 json
+                response_json = data[22:-1]
+                album_info = json.loads(response_json)
+                if not album_info.get("code") is 0:
+                    continue
+                genre = album_info.get("data").get("genre") # 获取流派
+                createTime = album_info.get("data").get("aDate") # 获取发行时间
             except:
-                # 如果发生了网络IO错误 则 重试
-                retry_times -= 1
-                continue
-            if response.status is not 200:
-                retry_times -= 1
-                continue
-            data = gzdecode(response.read())
-            conn.close()
-            # 从 data 中取出数据, 数据格式为 json
-            response_json = data[22:-1]
-            album_info = json.loads(response_json)
-            if not album_info.get("code") is 0:
-                retry_times -= 1
-                continue
-            genre = album_info.get("data").get("genre") # 获取流派
-            createTime = album_info.get("data").get("aDate") # 获取发行时间
+                if not retry_times is 1:
+                    continue
+
             # merge data
             audio["genre"] = genre
             audio["createTime"] = createTime
             # write data
             def write():
-                with open(TRACK_PATH, "ab+") as fp: # track file fp
-                    fp.seek(os.SEEK_END)
+                track_path = r"%s%s.%s" % (TRACK_PATH, url_params["file_tag"], FILE_TYPE)
+                if not os.path.exists(track_path): open(track_path, "w")
+                with open(track_path, "ab+") as fp: # track file fp
                     print >> fp, SPILIT_ICON.join([str(audio[k]) for k in audio])
             yield write()
-            yield TaskReturn(url = full_url, result = 1)
-        yield TaskReturn(url = full_url, result = 0)
+            yield TaskReturn(url = full_url, result = 1, retry_times = 50 - retry_times, http_cost = cost)
+        yield TaskReturn(url = full_url, result = 0, retry_times = 50 - retry_times, http_cost = 0)
     except GeneratorExit:
         pass
     except:
@@ -349,19 +357,21 @@ def spider_audioProfile_task(host, url_config, headers = {
         full_url = "http://%s%s" % (host, url)
         retry_times = 50
         while retry_times:
-            conn = HTTPConnection(host, timeout=10)
-            yield conn.request("GET", url, headers=headers)
-            try:
-                response = conn.getresponse()
-            except:
-                # 如果发生了网络IO错误 则 重试
-                retry_times -= 1
-                continue
-            if response.status is not 200:
-                retry_times -= 1
-                continue
-            data = gzdecode(response.read())
-            conn.close()
+            retry_times -= 1
+
+            # 需要改写
+            g = gevent.spawn(fetcher, host, url, scheme = "http", headers = headers)
+            while not g.ready() is True:
+                # gevent.sleep(0.001) # 1毫秒
+                gevent.sleep(0.25) # 250毫秒
+                ret = yield g
+
+            if isinstance(ret, gevent.Greenlet): ret = ret.value
+            if ret is None: continue
+            (data, cost) = ret
+            #######
+
+            data = gzdecode(data)
             # 从 data 中取出数据, 数据格式为HTML
             lan = ''
             reg_data = re.findall(r"<li class=\".* js_lan\">(.+)<\/li>", data)
@@ -375,11 +385,12 @@ def spider_audioProfile_task(host, url_config, headers = {
                 SPIDER_ALBUMPROFILE_CONFIG["url"],
                 audio = audio,
                 url_params = {
-                    "albummid": url_params["albummid"]
+                    "albummid": url_params["albummid"],
+                    "file_tag": url_params["file_tag"],
                 }
             ))
-            yield TaskReturn(url = full_url, result = 1)
-        yield TaskReturn(url = full_url, result = 0)
+            yield TaskReturn(url = full_url, result = 1, retry_times = 50 - retry_times, http_cost = cost)
+        yield TaskReturn(url = full_url, result = 0, retry_times = 50 - retry_times, http_cost = 0)
     except GeneratorExit:
         pass
     except:
@@ -405,19 +416,21 @@ def spider_singerList_task(host, url_config, headers = {
         full_url = "http://%s%s" % (host, url)
         retry_times = 50
         while retry_times:
-            conn = HTTPConnection(host, timeout=10)
-            yield conn.request("GET", url, headers=headers)
-            try:
-                response = conn.getresponse()
-            except:
-                # 如果发生了网络IO错误 则 重试
-                retry_times -= 1
-                continue
-            if response.status is not 200:
-                retry_times -= 1
-                continue
-            data = gzdecode(response.read())
-            conn.close()
+            retry_times -= 1
+
+            # 需要改写
+            g = gevent.spawn(fetcher, host, url, scheme = "https", headers = headers)
+            while not g.ready() is True:
+                # gevent.sleep(0.001) # 1毫秒
+                gevent.sleep(0.25) # 250毫秒
+                ret = yield g
+
+            if isinstance(ret, gevent.Greenlet): ret = ret.value
+            if ret is None: continue
+            (data, cost) = ret
+            #######
+
+            data = gzdecode(data)
             # 解析 data, 数据格式为 XML
             response_json = data[23:-1] # 截取字符串
             if response_json is '':
@@ -439,7 +452,8 @@ def spider_singerList_task(host, url_config, headers = {
                     SPIDER_SINGERPROFILE_CONFIG["url"],
                     singer = singer_data,
                     url_params = {
-                        "time": time() * 1000
+                        "time": time() * 1000,
+                        "file_tag": url_params["file_tag"],
                     }
                 ))
                 # 爬取歌手的单曲
@@ -450,6 +464,7 @@ def spider_singerList_task(host, url_config, headers = {
                     url_params = {
                         "begin": 0, # 从哪里开始
                         "num": 1000, # 一次拉多少歌曲
+                        "file_tag": url_params["file_tag"],
                     }
                 ))
                 # return
@@ -459,12 +474,13 @@ def spider_singerList_task(host, url_config, headers = {
                 SPIDER_SINGERLIST_CONFIG["url"],
                 url_params = {
                     "index": url_params["index"], # A, B, C, D...
-                    "pagenum": url_params["pagenum"] + 1 # 页数
+                    "pagenum": url_params["pagenum"] + 1, # 页数
+                    "file_tag": url_params["file_tag"],
                 }
             ))
-            yield TaskReturn(url = full_url, result = 1)
+            yield TaskReturn(url = full_url, result = 1, retry_times = 50 - retry_times, http_cost = cost)
         # 爬取失败
-        yield TaskReturn(url = full_url, result = 0)
+        yield TaskReturn(url = full_url, result = 0, retry_times = 50 - retry_times, http_cost = 0)
     except GeneratorExit:
         pass
     except:
@@ -478,13 +494,15 @@ def spider_singerList_task(host, url_config, headers = {
 ################################################################
 
 def Process_Start(index):
-    scheduler = Scheduler()
+    runtime_log = r"./%s/runtime_%s.log" % (SPIDER_TIME, index)
+    scheduler = Scheduler(runtime_log)
     task = Task(spider_singerList_task(
         SPIDER_SINGERLIST_CONFIG["host"],
         SPIDER_SINGERLIST_CONFIG["url"],
         url_params = {
             "index": index,
             "pagenum": 1,
+            "file_tag": index,
         }
     ))
     scheduler.put(task)
